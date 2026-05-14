@@ -1,9 +1,14 @@
-version: '3.8'
+version: '3.7'
 
 services:
-  myservice:
-    image: geo_photo_bot:latest
-    ports:
-      - "8080:80"
+  geophotobot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: geophotobot
+    restart: unless-stopped
     env_file:
       - .env
+    volumes:
+      - ./admins.json:/bot/admins.json
+      - ./allowed_users.json:/bot/allowed_users.json

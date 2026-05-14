@@ -1,21 +1,16 @@
-# Используем официальный образ Python
-FROM python:3.9-slim
+FROM python:3.11-slim
 
-# Устанавливаем рабочую директорию
 WORKDIR /bot
 
-# Копируем зависимости и исходный код
-COPY requirements.txt .
-COPY main.py .
-COPY allowed_users.json .
-COPY admins.json .
-COPY chatid.py .
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
 
-# Устанавливаем зависимости
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Создаем директорию для отчетов
-RUN mkdir -p /bot/reports
+COPY main.py .
+COPY admins.json .
+COPY allowed_users.json .
+COPY chatid.py .
 
-# Запускаем бота
 CMD ["python", "main.py"]
