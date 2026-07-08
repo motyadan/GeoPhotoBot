@@ -65,10 +65,17 @@ def get_user_name(user_id):
 
 def create_main_menu(user_id):
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    if is_admin(user_id):
-        markup.add(types.KeyboardButton("Добавить пользователя"))
+    # Большая основная кнопка для фотоотчёта
     if is_user_allowed(user_id):
         markup.add(types.KeyboardButton("Сделать фотоотчёт"))
+
+    # Компактные дополнительные кнопки
+    small_buttons = []
+    if is_admin(user_id):
+        small_buttons.append(types.KeyboardButton("Добавить пользователя"))
+    if small_buttons:
+        markup.add(*small_buttons)
+
     return markup
 
 @bot.message_handler(commands=['start', 'menu'])

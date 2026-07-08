@@ -1,8 +1,11 @@
 import telebot
 import json
+import html
 import mimetypes
 import os
 import re
+import shutil
+import subprocess
 import time
 from datetime import datetime
 from pathlib import Path
@@ -13,6 +16,7 @@ from urllib.parse import quote
 import requests
 from telebot import types
 from collections import defaultdict
+import threading
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -25,9 +29,10 @@ YANDEX_DISK_FOLDER = os.getenv('YANDEX_DISK_FOLDER', 'GeoPhotoReports').strip().
 
 ALLOWED_USERS_FILE = 'allowed_users.json'
 ADMINS_FILE = 'admins.json'
+SENSORS_FILE = 'sensors.json'
 YANDEX_API_BASE = "https://cloud-api.yandex.net/v1/disk"
 
-user_data = defaultdict(lambda: {"photos": [], "comment": ""})
+user_data = defaultdict(lambda: {"media": [], "comment": "", "report_type": "media", "sensor_name": ""})
 
 # ============ ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ============
 
@@ -53,6 +58,44 @@ def sanitize_for_path(name: str) -> str:
     """Заменяет все специальные символы на подчёркивание"""
     return re.sub(r'[\\/:*?"<>|#\s+,.-]', '_', name).strip('_')
 
+def compress_video(source_path: str) -> str:
+    """Сжимает видео для ускорения загрузки, если доступен ffmpeg."""
+    ffmpeg_path = shutil.which("ffmpeg")
+    if not ffmpeg_path:
+        return source_path
+
+    dest_path = f"{source_path}.compressed.mp4"
+    try:
+        subprocess.run(
+            [
+                ffmpeg_path,
+                "-y",
+                "-i",
+                source_path,
+                "-vf",
+                "scale=640:-2",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-crf",
+                "28",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "96k",
+                dest_path,
+            ],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return dest_path
+    except Exception as e:
+        print(f"Video compression failed: {e}")
+        return source_path
+
+
 def get_admins():
     try:
         with open(ADMINS_FILE, 'r', encoding='utf-8') as f:
@@ -74,6 +117,20 @@ def get_allowed_users():
 def save_allowed_users(users):
     with open(ALLOWED_USERS_FILE, 'w', encoding='utf-8') as f:
         json.dump(users, f, ensure_ascii=False, indent=4)
+
+
+def get_sensors():
+    try:
+        with open(SENSORS_FILE, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+
+def save_sensors(sensors):
+    with open(SENSORS_FILE, 'w', encoding='utf-8') as f:
+        json.dump(sensors, f, ensure_ascii=False, indent=4)
+
 
 def is_admin(user_id):
     return str(user_id) in get_admins()
@@ -174,16 +231,10 @@ def init_yandex_uploader():
         yandex_uploader = YandexDiskUploader(YANDEX_DISK_TOKEN, YANDEX_DISK_FOLDER)
 
 
-def upload_report_file_to_cloud(local_path, safe_user_name, month_folder, report_folder_name):
+def upload_report_file_to_cloud(local_path, relative_parts):
     if not yandex_uploader:
         return
 
-    relative_parts = [
-        safe_user_name,
-        month_folder,
-        report_folder_name,
-        Path(local_path).name,
-    ]
     try:
         yandex_uploader.upload_file(local_path, relative_parts)
     except Exception as e:
@@ -213,7 +264,19 @@ def get_all_disk_url() -> Optional[str]:
         return None
 
 
-def save_photos_thread(photos, safe_user_name, safe_comment, chat_id_str, timestamp):
+def get_sensors_disk_url() -> Optional[str]:
+    """Возвращает публичную ссылку на папку с датчиками на Яндекс.Диске"""
+    if not yandex_uploader:
+        return None
+
+    try:
+        return yandex_uploader.publish_path(f"disk:/{YANDEX_DISK_FOLDER}/Датчики")
+    except Exception as e:
+        print(f"Ошибка при открытии папки 'Датчики' на Яндекс Диске: {e}")
+        return None
+
+
+def save_media_thread(media_items, safe_user_name, safe_comment, chat_id_str, timestamp):
     now = datetime.now()
     month_name = get_russian_month_name(now.month)
     month_folder = f"{month_name}_{now.year}"
@@ -223,25 +286,39 @@ def save_photos_thread(photos, safe_user_name, safe_comment, chat_id_str, timest
     report_folder_name = sanitize_for_path(report_folder_name)
     public_url = None
 
-    for idx, file_id in enumerate(photos, start=1):
+    for idx, item in enumerate(media_items, start=1):
         temp_path = None
+        compressed_path = None
         try:
-            file_info = bot.get_file(file_id)
+            file_info = bot.get_file(item["file_id"])
             file_path = file_info.file_path
-            photo_data = bot.download_file(file_path)
-            filename = f"{chat_id_str}-{timestamp}-{idx}.jpg"
+            file_data = bot.download_file(file_path)
+            suffix = Path(file_path).suffix
+            if not suffix:
+                suffix = ".mp4" if item["type"] == "video" else ".jpg"
+            filename = f"{chat_id_str}-{timestamp}-{idx}{suffix}"
 
-            with NamedTemporaryFile(delete=False, suffix=".jpg", prefix="report_") as temp_file:
-                temp_file.write(photo_data)
+            with NamedTemporaryFile(delete=False, suffix=suffix, prefix="report_") as temp_file:
+                temp_file.write(file_data)
                 temp_path = temp_file.name
 
-            upload_report_file_to_cloud(temp_path, safe_user_name, month_folder, report_folder_name)
+            upload_path = temp_path
+            if item["type"] == "video":
+                compressed_path = compress_video(temp_path)
+                upload_path = compressed_path
+
+            upload_report_file_to_cloud(upload_path, [safe_user_name, month_folder, report_folder_name, filename])
         except Exception as e:
-            print(f"Ошибка при сохранении {file_id}: {e}")
+            print(f"Ошибка при сохранении {item['file_id']}: {e}")
         finally:
             if temp_path and os.path.exists(temp_path):
                 try:
                     os.remove(temp_path)
+                except OSError:
+                    pass
+            if compressed_path and compressed_path != temp_path and os.path.exists(compressed_path):
+                try:
+                    os.remove(compressed_path)
                 except OSError:
                     pass
 
@@ -255,16 +332,77 @@ def save_photos_thread(photos, safe_user_name, safe_comment, chat_id_str, timest
 
     return public_url
 
+
+def save_sensor_media_thread(media_items, sensor_name, timestamp):
+    now = datetime.now()
+    date_str = now.strftime("%d-%m-%Y")
+    report_folder_name = sanitize_for_path(f"{date_str}_отчет")
+    safe_sensor_name = sanitize_for_path(sensor_name)
+    public_url = None
+
+    for idx, item in enumerate(media_items, start=1):
+        temp_path = None
+        compressed_path = None
+        try:
+            file_info = bot.get_file(item["file_id"])
+            file_path = file_info.file_path
+            file_data = bot.download_file(file_path)
+            suffix = Path(file_path).suffix
+            if not suffix:
+                suffix = ".mp4" if item["type"] == "video" else ".jpg"
+            filename = f"{safe_sensor_name}-{timestamp}-{idx}{suffix}"
+
+            with NamedTemporaryFile(delete=False, suffix=suffix, prefix="report_") as temp_file:
+                temp_file.write(file_data)
+                temp_path = temp_file.name
+
+            upload_path = temp_path
+            if item["type"] == "video":
+                compressed_path = compress_video(temp_path)
+                upload_path = compressed_path
+
+            upload_report_file_to_cloud(upload_path, ["Датчики", safe_sensor_name, report_folder_name, filename])
+        except Exception as e:
+            print(f"Ошибка при сохранении {item['file_id']}: {e}")
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    pass
+            if compressed_path and compressed_path != temp_path and os.path.exists(compressed_path):
+                try:
+                    os.remove(compressed_path)
+                except OSError:
+                    pass
+
+    if yandex_uploader:
+        try:
+            public_url = yandex_uploader.publish_path(
+                f"disk:/{YANDEX_DISK_FOLDER}/Датчики/{safe_sensor_name}/{report_folder_name}"
+            )
+        except Exception as e:
+            print(f"Failed to publish Yandex Disk folder: {e}")
+
+    return public_url
+
 bot = telebot.TeleBot(TOKEN)
 
 def send_main_menu(chat_id, user_id):
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    buttons = []
-    if is_admin(user_id):
-        buttons.append(types.KeyboardButton("Админ панель"))
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    # Большая основная кнопка для фото/медиа отчёта
     if is_user_allowed(user_id):
-        buttons.append(types.KeyboardButton("Сделать фотоотчёт"))
-    markup.add(*buttons)
+        markup.add(types.KeyboardButton("Сделать фотоотчёт"))
+
+    # Компактные дополнительные кнопки
+    small_buttons = []
+    if is_admin(user_id):
+        small_buttons.append(types.KeyboardButton("Админ панель"))
+    if is_user_allowed(user_id):
+        small_buttons.append(types.KeyboardButton("Датчики"))
+    if small_buttons:
+        markup.add(*small_buttons)
+
     bot.send_message(chat_id, "Выберите действие:", reply_markup=markup)
 
 @bot.message_handler(commands=['start'])
@@ -305,6 +443,24 @@ def alldisk(message):
     bot.send_message(
         message.chat.id,
         f'<a href="{public_url}">Яндекс.Диск</a>',
+        parse_mode='HTML',
+    )
+
+
+@bot.message_handler(commands=['sensors'])
+def sensors_command(message):
+    if not is_user_allowed(message.from_user.id):
+        return bot.reply_to(message, "Нет доступа.")
+    if not yandex_uploader:
+        return bot.reply_to(message, "Яндекс Диск не настроен.")
+
+    public_url = get_sensors_disk_url()
+    if not public_url:
+        return bot.reply_to(message, "Не удалось открыть папку с датчиками на Яндекс.Диске.")
+
+    bot.send_message(
+        message.chat.id,
+        f'<a href="{public_url}">Папка Датчики на Яндекс.Диске</a>',
         parse_mode='HTML',
     )
 
@@ -405,6 +561,127 @@ def manage_admins(message):
     bot.send_message(message.chat.id, "Управление админами:", reply_markup=markup)
 
 
+@bot.message_handler(func=lambda msg: msg.text == "Добавить объект")
+def add_sensor_object_request(message):
+    if not is_user_allowed(message.from_user.id):
+        return bot.reply_to(message, "Нет доступа.")
+
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
+    markup.add(types.KeyboardButton("Отмена"))
+    msg = bot.send_message(
+        message.chat.id,
+        "Введите название объекта для датчиков:",
+        reply_markup=markup
+    )
+    bot.register_next_step_handler(msg, create_sensor_object)
+
+
+@bot.message_handler(func=lambda msg: msg.text == "Удалить объект")
+def delete_sensor_request(message):
+    if not is_user_allowed(message.from_user.id):
+        return bot.reply_to(message, "Нет доступа.")
+
+    sensors = get_sensors()
+    if not sensors:
+        return bot.send_message(message.chat.id, "Список объектов пуст. Добавьте новый объект.")
+
+    markup = types.InlineKeyboardMarkup()
+    for index, sensor in enumerate(sensors):
+        markup.add(types.InlineKeyboardButton(text=sensor, callback_data=f"del_sensor_{index}"))
+    markup.add(types.InlineKeyboardButton(text="Отмена", callback_data="cancel_sensor_action"))
+
+    bot.send_message(message.chat.id, "Выберите объект для удаления:", reply_markup=markup)
+
+
+def create_sensor_object(message):
+    if not is_user_allowed(message.from_user.id):
+        return bot.reply_to(message, "Нет доступа.")
+    name = message.text.strip()
+    if not name:
+        return bot.reply_to(message, "Название объекта не может быть пустым.")
+
+    if name.lower() == "отмена":
+        bot.reply_to(message, "Добавление объекта отменено.")
+        return sensors_menu(message)
+
+    sensors = get_sensors()
+    if name in sensors:
+        bot.reply_to(message, f"Объект '{name}' уже существует.")
+    else:
+        sensors.append(name)
+        save_sensors(sensors)
+        bot.reply_to(message, f"Объект '{name}' добавлен.")
+
+    sensors_menu(message)
+
+
+@bot.message_handler(func=lambda msg: msg.text == "Датчики")
+def sensors_menu(message):
+    if not is_user_allowed(message.from_user.id):
+        return bot.reply_to(message, "Нет доступа.")
+    sensors = get_sensors()
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    if sensors:
+        for sensor in sensors:
+            markup.add(types.KeyboardButton(sensor))
+    else:
+        bot.send_message(message.chat.id, "Список объектов пуст. Добавьте новый объект.")
+    markup.add(types.KeyboardButton("Добавить объект"))
+    markup.add(types.KeyboardButton("Удалить объект"))
+    markup.add(types.KeyboardButton("Назад"))
+    bot.send_message(
+        message.chat.id,
+        "Выберите объект для отчёта по датчикам или добавьте/удалите объект.",
+        reply_markup=markup
+    )
+
+
+@bot.message_handler(func=lambda msg: msg.text in get_sensors())
+def select_sensor_object(message):
+    if not is_user_allowed(message.from_user.id):
+        return bot.reply_to(message, "Нет доступа.")
+    uid = str(message.from_user.id)
+    user_data[uid] = {
+        "media": [],
+        "comment": "",
+        "report_type": "sensors",
+        "sensor_name": message.text,
+    }
+    # Сначала запрашиваем комментарий (например, номер сваи) с опцией пропустить
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    markup.add(types.KeyboardButton("Пропустить"), types.KeyboardButton("Отмена"))
+    msg = bot.send_message(
+        message.chat.id,
+        "Напишите комментарий (например, номер сваи) или нажмите Пропустить",
+        reply_markup=markup
+    )
+    bot.register_next_step_handler(msg, handle_sensor_comment)
+
+
+def handle_sensor_comment(message):
+    text = (message.text or "").strip()
+    if text.lower() == "отмена":
+        return cancel_report(message)
+
+    uid = str(message.from_user.id)
+    # Возможность пропустить ввод комментария
+    if text.lower() in ("пропустить", "/skip", "/пропустить"):
+        user_data[uid]["comment"] = ""
+    else:
+        # Сохраняем комментарий и предлагаем отправить медиа
+        user_data[uid]["comment"] = message.text
+
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.add(types.KeyboardButton("Завершить отчёт"))
+    markup.add(types.KeyboardButton("Отменить отчёт"))
+
+    bot.send_message(
+        message.chat.id,
+        f"Теперь отправь фото или видео для отчёта по датчику '{user_data[uid]['sensor_name']}'. Когда закончишь, нажми 'Завершить отчёт'.",
+        reply_markup=markup
+    )
+
+
 @bot.message_handler(func=lambda msg: msg.text == "Добавить админа")
 def add_admin_request(message):
     if not is_admin(message.from_user.id):
@@ -463,8 +740,56 @@ def delete_admin_request(message):
 
 # ============ INLINE-КНОПКИ ============
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith(("del_user_", "del_admin_")))
+@bot.callback_query_handler(func=lambda call: call.data.startswith(("del_user_", "del_admin_", "del_sensor_", "cancel_sensor_action")))
 def handle_delete(call):
+    if call.data == "cancel_sensor_action":
+        if not is_user_allowed(call.from_user.id):
+            bot.answer_callback_query(call.id, "Нет доступа.")
+            return
+
+        bot.edit_message_text(
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            text="Удаление объекта отменено."
+        )
+        bot.answer_callback_query(call.id)
+        return
+
+    if call.data.startswith("del_sensor_"):
+        if not is_user_allowed(call.from_user.id):
+            bot.answer_callback_query(call.id, "Нет доступа.")
+            return
+
+        try:
+            sensor_index = int(call.data[len("del_sensor_"):])
+        except ValueError:
+            bot.edit_message_text(
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                text="Неверный объект для удаления."
+            )
+            bot.answer_callback_query(call.id)
+            return
+
+        sensors = get_sensors()
+        if 0 <= sensor_index < len(sensors):
+            sensor_name = sensors.pop(sensor_index)
+            save_sensors(sensors)
+            bot.edit_message_text(
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                text=f"Объект '{sensor_name}' удалён."
+            )
+        else:
+            bot.edit_message_text(
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                text="Объект не найден."
+            )
+
+        bot.answer_callback_query(call.id)
+        return
+
     if not is_admin(call.from_user.id):
         bot.answer_callback_query(call.id, "Нет доступа.")
         return
@@ -515,7 +840,7 @@ def report_start(message):
     if not is_user_allowed(message.from_user.id):
         return bot.reply_to(message, "Нет доступа.")
     uid = str(message.from_user.id)
-    user_data[uid] = {"photos": [], "comment": ""}
+    user_data[uid] = {"media": [], "comment": "", "report_type": "media", "sensor_name": ""}
 
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
     markup.add(types.KeyboardButton("Отмена"))
@@ -541,18 +866,22 @@ def handle_comment(message):
 
     bot.send_message(
         message.chat.id,
-        "Теперь отправь фото. Когда закончишь, нажми 'Завершить отчёт'.",
+        "Теперь отправь фото или видео. Когда закончишь, нажми 'Завершить отчёт'.",
         reply_markup=markup
     )
 
 
-@bot.message_handler(content_types=['photo'])
-def handle_photo(message):
+@bot.message_handler(content_types=['photo', 'video'])
+def handle_media(message):
     uid = str(message.from_user.id)
     if not is_user_allowed(message.from_user.id):
-        return bot.reply_to(message, "Нет доступа для отправки фото.")
-    file_id = message.photo[-1].file_id
-    user_data[uid]["photos"].append(file_id)
+        return bot.reply_to(message, "Нет доступа для отправки медиа.")
+
+    if message.content_type == 'photo':
+        file_id = message.photo[-1].file_id
+        user_data[uid]["media"].append({"type": "photo", "file_id": file_id})
+    elif message.content_type == 'video':
+        user_data[uid]["media"].append({"type": "video", "file_id": message.video.file_id})
 
 @bot.message_handler(func=lambda msg: msg.text == "Завершить отчёт")
 def finish_report(message):
@@ -560,54 +889,132 @@ def finish_report(message):
     if not is_user_allowed(message.from_user.id):
         return bot.reply_to(message, "Нет доступа.")
 
-    photos = user_data[uid]["photos"]
-    comment_raw = user_data[uid]["comment"]
+    # Защита от повторного нажатия: если отправка уже запущена, игнорируем
+    if user_data[uid].get("locked"):
+        return bot.send_message(message.chat.id, "Отчёт уже отправляется, подождите...")
+
+    media_items = user_data[uid]["media"]
+    report_type = user_data[uid].get("report_type", "media")
+    comment_raw = user_data[uid].get("comment", "")
     name_raw = get_user_name(uid)
     chat_id_str = uid
 
-    if not comment_raw or comment_raw.strip() == "":
-        return bot.send_message(message.chat.id, "Нужно ввести комментарий к фотоотчёту. Начните заново с кнопки 'Сделать фотоотчёт'.")
+    if report_type == "media":
+        if not comment_raw or comment_raw.strip() == "":
+            return bot.send_message(message.chat.id, "Нужно ввести комментарий к отчёту. Начните заново с кнопки 'Сделать фотоотчёт'.")
 
-    if not photos:
-        return bot.send_message(message.chat.id, "Вы не отправили ни одной фотографии.")
+    if not media_items:
+        return bot.send_message(message.chat.id, "Вы не отправили ни одного медиафайла.")
 
+    # Помечаем, что отправка началась (защита от повторных нажатий во время отправки)
+    user_data[uid]["locked"] = True
     sending_msg = bot.send_message(message.chat.id, "Отправка...")
-
-    safe_user_name = sanitize_for_path(name_raw)
-    safe_comment = sanitize_for_path(comment_raw)
+    public_url = None
     timestamp = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
-    photos_copy = list(photos)
-    public_url = save_photos_thread(photos_copy, safe_user_name, safe_comment, chat_id_str, timestamp)
+    media_copy = list(media_items)
 
-    caption = f"<b>Фотоотчёт от {name_raw}</b>\nОбъект: {comment_raw}"
-    if public_url:
-        caption += f'\n<a href="{public_url}">Яндекс.Диск</a>'
+    if report_type == "media":
+        safe_name = html.escape(name_raw)
+        safe_comment = html.escape(comment_raw)
+        caption = f"<b>Отчёт от {safe_name}</b>\nОбъект: {safe_comment}"
+    else:
+        sensor_name = user_data[uid].get("sensor_name", "")
+        if not sensor_name:
+            return bot.send_message(message.chat.id, "Не выбран объект для отчёта по датчикам. Начните заново.")
+        safe_sensor_name = html.escape(sensor_name)
+        safe_name = html.escape(name_raw)
+        safe_comment = html.escape(comment_raw)
+        comment_line = f"\nКомментарий: {safe_comment}" if safe_comment else ""
+        caption = f"<b>{safe_sensor_name}</b> - отчет по датчикам ({safe_name}){comment_line}"
 
+    # Отправляем медиа в канал сразу (без ожидания загрузки на Диск)
     chunk_size = 10
-    for i in range(0, len(photos), chunk_size):
-        group = photos[i:i + chunk_size]
+    for i in range(0, len(media_items), chunk_size):
+        group = media_items[i:i + chunk_size]
         media_group = []
-        for j, file_id in enumerate(group):
-            if j == 0:
-                media_group.append(types.InputMediaPhoto(media=file_id, caption=caption, parse_mode='HTML'))
+        for j, item in enumerate(group):
+            if item["type"] == "photo":
+                if j == 0:
+                    media_group.append(types.InputMediaPhoto(media=item["file_id"], caption=caption, parse_mode='HTML'))
+                else:
+                    media_group.append(types.InputMediaPhoto(media=item["file_id"]))
             else:
-                media_group.append(types.InputMediaPhoto(media=file_id))
+                if j == 0:
+                    media_group.append(types.InputMediaVideo(media=item["file_id"], caption=caption, parse_mode='HTML'))
+                else:
+                    media_group.append(types.InputMediaVideo(media=item["file_id"]))
         bot.send_media_group(CHANNEL_ID, media_group)
 
-    user_data[uid] = {"photos": [], "comment": ""}
+    # Снимаем локальную блокировку — отправка в канал завершена
+    user_data[uid]["locked"] = False
 
-    user_message = "Отчёт отправлен в канал."
-    if public_url:
-        user_message += f'\n<a href="{public_url}">Яндекс.Диск</a>'
+    # Фоновая загрузка на Яндекс.Диск (не блокирует отправку в канал)
+    def background_upload():
+        try:
+            if report_type == "media":
+                safe_user_name = sanitize_for_path(name_raw)
+                safe_comment = sanitize_for_path(comment_raw)
+                url = save_media_thread(media_copy, safe_user_name, safe_comment, chat_id_str, timestamp)
+            else:
+                sensor_name = user_data[uid].get("sensor_name", "")
+                url = save_sensor_media_thread(media_copy, sensor_name, timestamp)
 
-    bot.edit_message_text(user_message, chat_id=message.chat.id, message_id=sending_msg.message_id, parse_mode='HTML')
+            if url:
+                try:
+                    if report_type == "media":
+                        channel_text = f'<b>Отчёт от {name_raw}</b>\nОбъект: {comment_raw}\n<a href="{url}">Яндекс.Диск</a>'
+                    else:
+                        comment_line = f"\nКомментарий: {html.escape(comment_raw)}" if comment_raw else ""
+                        channel_text = f'<b>{sensor_name}</b> - отчет по датчикам ({name_raw}){comment_line}\n<a href="{url}">Яндекс.Диск</a>'
+                    bot.send_message(CHANNEL_ID, channel_text, parse_mode='HTML')
+                except Exception:
+                    pass
+                try:
+                    bot.send_message(message.chat.id, f'Отчёт отправлен в канал.\n<a href="{url}">Яндекс.Диск</a>', parse_mode='HTML')
+                except Exception:
+                    pass
+        except Exception as e:
+            print(f"Background upload failed: {e}")
+
+    threading.Thread(target=background_upload, daemon=True).start()
+
+    user_data[uid] = {"media": [], "comment": "", "report_type": "media", "sensor_name": ""}
+
+    # Очистим возможные зарегистрированные "next step" обработчики
+    try:
+        bot.clear_step_handler(message)
+    except Exception:
+        try:
+            bot.clear_step_handler_by_chat_id(message.chat.id)
+        except Exception:
+            pass
+
+    # Удаляем предыдущую клавиатуру прежде чем показать главное меню
+    try:
+        bot.send_message(message.chat.id, " ", reply_markup=types.ReplyKeyboardRemove())
+    except Exception:
+        pass
+
     send_main_menu(message.chat.id, message.from_user.id)
 
-@bot.message_handler(func=lambda msg: msg.text in ["Отменить отчёт", "Отмена"])
+@bot.message_handler(func=lambda msg: (msg.text or "").strip() in ["Отменить отчёт", "Отменить отчет", "Отмена"])
 def cancel_report(message):
     uid = str(message.from_user.id)
-    user_data[uid] = {"photos": [], "comment": ""}
-    bot.send_message(message.chat.id, "Отчёт отменён.")
+    user_data[uid] = {"media": [], "comment": "", "report_type": "media", "sensor_name": ""}
+    # Очистим возможные зарегистрированные "next step" обработчики, чтобы не осталось висящих шагов
+    try:
+        bot.clear_step_handler(message)
+    except Exception:
+        try:
+            bot.clear_step_handler_by_chat_id(message.chat.id)
+        except Exception:
+            pass
+
+    # Удаляем клавиатуру и возвращаем пользователя в главное меню
+    try:
+        bot.send_message(message.chat.id, "Отчёт отменён.", reply_markup=types.ReplyKeyboardRemove())
+    except Exception:
+        bot.send_message(message.chat.id, "Отчёт отменён.")
     send_main_menu(message.chat.id, message.from_user.id)
 
 # ============ ОСТАЛЬНЫЕ ОБРАБОТЧИКИ ============
@@ -622,6 +1029,9 @@ if __name__ == '__main__':
     load_dotenv()
     init_yandex_uploader()
     # Создаем пустой файл admins.json, если его нет
+    if not os.path.exists(SENSORS_FILE):
+        with open(SENSORS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(["Датчик 1", "Датчик 2", "Датчик 3"], f, ensure_ascii=False, indent=4)
     if not os.path.exists(ADMINS_FILE):
         with open(ADMINS_FILE, 'w', encoding='utf-8') as f:
             json.dump({}, f, ensure_ascii=False, indent=4)
